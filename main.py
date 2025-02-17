@@ -6,6 +6,7 @@ import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import LabelEncoder
 import tensorflow as tf
+import gc
 
 # Variables globales para compartir datos entre funciones
 df = None
@@ -26,53 +27,74 @@ async def lifespan(app: FastAPI):
     print("Iniciando startup...")
     try:
         # 1. Cargar CSV y preprocesar datos
-        df = pd.read_csv("productos.csv")
-        df['discount_price'] = df['discount_price'].replace({'₹': '', ',': ''}, regex=True).astype(float)
-        df['actual_price'] = df['actual_price'].replace({'₹': '', ',': ''}, regex=True).astype(float)
+        # Especificar columnas y tipos para optimizar memoria
+        usecols = ["name", "discount_price", "actual_price", "main_category", "sub_category"]
+        df = pd.read_csv(
+            "productos.csv", 
+            usecols=usecols, 
+            dtype={
+                "name": "string", 
+                "discount_price": "string", 
+                "actual_price": "string", 
+                "main_category": "string", 
+                "sub_category": "string"
+            }
+        )
+        
+        # Convertir precios a float32 y eliminar caracteres innecesarios
+        df['discount_price'] = (
+            df['discount_price']
+            .replace({'₹': '', ',': ''}, regex=True)
+            .astype(np.float32)
+        )
+        df['actual_price'] = (
+            df['actual_price']
+            .replace({'₹': '', ',': ''}, regex=True)
+            .astype(np.float32)
+        )
+
+        # Normalización de precios con float32
+        max_discount = df['discount_price'].max()
+        max_actual = df['actual_price'].max()
+        if max_discount > 0:
+            df['discount_price'] = df['discount_price'] / max_discount
+        if max_actual > 0:
+            df['actual_price'] = df['actual_price'] / max_actual
 
         # Codificar variables
         name_enc = LabelEncoder()
         df['name_encoded'] = name_enc.fit_transform(df['name'])
-
         main_cat_enc = LabelEncoder()
         df['main_category_encoded'] = main_cat_enc.fit_transform(df['main_category'])
-
         sub_cat_enc = LabelEncoder()
         df['sub_category_encoded'] = sub_cat_enc.fit_transform(df['sub_category'])
         print("Variables codificadas.")
-
-        # Normalización de precios
-        df['discount_price'] = df['discount_price'] / df['discount_price'].max()
-        df['actual_price'] = df['actual_price'] / df['actual_price'].max()
-        print("Preprocesamiento completado.")
 
         # Crear mapeos para convertir entre nombre e ID
         temp_id_to_name = df[['name_encoded', 'name']].drop_duplicates().set_index('name_encoded')['name'].to_dict()
         id_to_name = {int(k): v for k, v in temp_id_to_name.items()}
         name_to_id = {v: int(k) for k, v in id_to_name.items()}
         print("Mapeos creados.")
+        print("Preprocesamiento completado.")
 
-        # 2. Cargar el modelo TFLite
+        # 2. Cargar el modelo TFLite (se recomienda usar un modelo cuantizado)
         interpreter = tf.lite.Interpreter(model_path="recomendacion.tflite")
         interpreter.allocate_tensors()
         print("Modelo TFLite cargado y tensores asignados.")
 
-        # Función para extraer los pesos del embedding de manera más precisa
+        # Función para extraer los pesos del embedding
         def get_embedding_weights(layer_name):
             candidates = []
             for tensor_detail in interpreter.get_tensor_details():
-                # Filtrar por el nombre y descartar operaciones internas (por ejemplo, strided_slice)
                 if layer_name in tensor_detail["name"] and "strided_slice" not in tensor_detail["name"]:
                     tensor = interpreter.get_tensor(tensor_detail["index"])
-                    # Suponemos que la matriz de embedding tiene al menos dos dimensiones
                     if len(tensor.shape) >= 2:
                         candidates.append((tensor_detail, tensor))
             if not candidates:
                 raise ValueError(f"No se encontró tensor adecuado para la capa '{layer_name}'")
-            # Seleccionar el primer candidato (o podrías elegir el que cumpla mejor el criterio)
             selected_detail, selected_tensor = candidates[0]
             print(f"Tensor para '{layer_name}' seleccionado: {selected_detail['name']} con shape {selected_tensor.shape}")
-            return selected_tensor
+            return selected_tensor.astype(np.float32)  # Asegurarse de usar float32
 
         # 3. Extraer pesos de los embeddings
         prod_weights = get_embedding_weights("product_embedding")
@@ -89,10 +111,17 @@ async def lifespan(app: FastAPI):
             vec_prod = prod_weights[product_id]
             vec_main = main_weights[main_cat]
             vec_sub = sub_weights[sub_cat]
-            return np.concatenate([vec_prod, vec_main, vec_sub])
+            return np.concatenate([vec_prod, vec_main, vec_sub]).astype(np.float32)
         
-        combined_embeddings = np.array([get_vector_combinado(pid) for pid in range(num_products)])
+        combined_embeddings = np.array(
+            [get_vector_combinado(pid) for pid in range(num_products)], 
+            dtype=np.float32
+        )
         print("Vectores combinados calculados.")
+
+        # Liberar el DataFrame ya que no se usará más
+        del df
+        gc.collect()
 
     except Exception as e:
         print("Error en startup:", e)
