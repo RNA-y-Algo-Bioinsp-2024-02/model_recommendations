@@ -21,7 +21,7 @@ sub_weights = None
 num_products = None
 
 # URL de Google Drive (extraída de tu enlace compartido)
-GOOGLE_DRIVE_MODEL_URL = "https://drive.google.com/uc?id=1Mmq9y2ShP7dVseUE7e0iYyI76DqUZ3nL"
+GOOGLE_DRIVE_MODEL_URL = "https://drive.google.com/file/d/1mHCNZ4Rp6US5yl8Kect8z-0w5_KDqMDc/view?usp=sharing"
 MODEL_PATH = "recomendacion.keras"
 
 @asynccontextmanager
