@@ -18,6 +18,13 @@ main_weights = None
 sub_weights = None
 num_products = None
 
+<<<<<<< HEAD
+=======
+# URL de Google Drive (extraída de tu enlace compartido)
+GOOGLE_DRIVE_MODEL_URL = "https://drive.google.com/file/d/1mHCNZ4Rp6US5yl8Kect8z-0w5_KDqMDc/view?usp=sharing"
+MODEL_PATH = "recomendacion.keras"
+
+>>>>>>> 0d6a4daf13bb6dcdc6b2c76a39223d0c4381e25a
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global df, interpreter, combined_embeddings, id_to_name, name_to_id
