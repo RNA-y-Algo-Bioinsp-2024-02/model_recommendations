@@ -19,3 +19,4 @@ tensorflow
 tensorflow-io-gcs-filesystem
 tqdm
 uvicorn
+gdown
