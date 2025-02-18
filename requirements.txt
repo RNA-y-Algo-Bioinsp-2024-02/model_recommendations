@@ -13,7 +13,6 @@ statsmodels==0.14.4
 # Machine Learning y TensorFlow
 tensorflow==2.18.0
 tensorflow-io-gcs-filesystem==0.31.0
-tensorflow_intel==2.18.0
 faiss-cpu==1.10.0
 joblib==1.4.2
 threadpoolctl==3.5.0
