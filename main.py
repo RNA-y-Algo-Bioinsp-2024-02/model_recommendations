@@ -29,7 +29,7 @@ sub_weights = None
 num_products = None
 product_meta = None
 
-# Definir el directorio de trabajo en DigitalOcean
+# Definir el directorio de trabajo
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @asynccontextmanager
@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
 
     print("Iniciando startup...")
     try:
-        # Ruta correcta de los archivos en DigitalOcean
+        # Ruta de los archivos
         csv_path = os.path.join(BASE_DIR, "productos.csv")
         model_path = os.path.join(BASE_DIR, "recomendacion.tflite")
 
@@ -48,11 +48,9 @@ async def lifespan(app: FastAPI):
         df = pd.read_csv(csv_path, usecols=usecols, dtype=str)
         print(f"Uso de memoria después de cargar CSV: {get_memory_usage_mb():.2f} MB")
 
-        # Convertir precios
+        # Convertir precios y normalizarlos
         df['discount_price'] = df['discount_price'].str.replace('₹', '').str.replace(',', '').astype(np.float32)
         df['actual_price'] = df['actual_price'].str.replace('₹', '').str.replace(',', '').astype(np.float32)
-
-        # Normalizar precios
         df['discount_price'] /= df['discount_price'].max()
         df['actual_price'] /= df['actual_price'].max()
 
@@ -74,7 +72,7 @@ async def lifespan(app: FastAPI):
 
         print("Mapeos creados.")
 
-        # Crear matriz de categorías de productos
+        # Crear matriz de metadatos de productos (main_category y sub_category)
         num_products = df['name_encoded'].max() + 1
         product_meta = np.zeros((num_products, 2), dtype=np.int32)
         for _, row in df.iterrows():
@@ -89,11 +87,20 @@ async def lifespan(app: FastAPI):
 
         # Función para extraer pesos de embeddings
         def get_embedding_weights(layer_name):
+            encontrado = False
+            tensor_final = None
             for tensor_detail in interpreter.get_tensor_details():
                 if layer_name in tensor_detail["name"]:
                     tensor = interpreter.get_tensor(tensor_detail["index"])
-                    return tensor.astype(np.float32)
-            raise ValueError(f"No se encontró tensor para {layer_name}")
+                    print(f"Encontrado tensor: {tensor_detail['name']} con shape {tensor.shape}")
+                    # Se espera que el tensor tenga al menos 2 dimensiones
+                    if tensor.ndim >= 2:
+                        tensor_final = tensor.astype(np.float32)
+                        encontrado = True
+                        break
+            if not encontrado:
+                raise ValueError(f"No se encontró tensor para {layer_name} con al menos 2 dimensiones")
+            return tensor_final
 
         # Extraer embeddings
         prod_weights = get_embedding_weights("product_embedding")
@@ -102,7 +109,7 @@ async def lifespan(app: FastAPI):
 
         print("Pesos de embeddings extraídos.")
 
-        # Liberar memoria
+        # Liberar recursos del intérprete
         del interpreter
         interpreter = None
         gc.collect()
@@ -128,16 +135,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# **Health Check para DigitalOcean**
+# Health Check
 @app.get("/")
 def health_check():
     return {"status": "ok"}
 
-# Funciones para embeddings
+# Funciones para obtener embeddings combinados
 def get_combined_embedding(product_id: int):
     main_cat = product_meta[product_id, 0]
     sub_cat = product_meta[product_id, 1]
-    vec_prod = prod_weights[product_id]
+    vec_prod = prod_weights[product_id]      # Se espera que prod_weights sea de shape (num_products, embedding_dim)
     vec_main = main_weights[main_cat]
     vec_sub = sub_weights[sub_cat]
     return np.concatenate([vec_prod, vec_main, vec_sub]).astype(np.float32)
@@ -156,20 +163,24 @@ def recomendar_productos_combinados(product_id: int, top_n: int = 5):
     combined_embeddings = get_all_combined_embeddings()
     similitudes = cosine_similarity(query_vec, combined_embeddings)[0]
     indices_similares = np.argsort(-similitudes)
+    # Excluir el producto consultado
     indices_similares = [i for i in indices_similares if i != product_id]
     return indices_similares[:top_n]
 
-# **Endpoint de Recomendaciones**
+# Endpoint de Recomendaciones
 @app.get("/recomendaciones")
 def get_recomendaciones(product_name: str, top_n: int = 5):
     if product_name not in name_to_id:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
     product_id = name_to_id[product_name]
     recomendados_ids = recomendar_productos_combinados(product_id, top_n)
-    recomendaciones = [{"id": pid, "name": id_to_name.get(pid, f"ID {pid}")} for pid in recomendados_ids]
+    recomendaciones = [
+        {"id": int(pid), "name": id_to_name.get(int(pid), f"ID {pid}")}
+        for pid in recomendados_ids
+    ]
     return {"producto": product_name, "recomendaciones": recomendaciones}
 
-# **Ejecutar Uvicorn**
+# Ejecutar Uvicorn si se corre directamente
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     import uvicorn
