@@ -1,65 +1,62 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
+import os
+import gc
+import psutil
 import numpy as np
 import pandas as pd
+import tensorflow as tf
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import LabelEncoder
-import tensorflow as tf
-import gc
+from contextlib import asynccontextmanager
 
-# Variables globales para compartir datos entre funciones
+# Función para obtener uso de memoria
+def get_memory_usage_mb():
+    process = psutil.Process(os.getpid())
+    mem_bytes = process.memory_info().rss
+    return mem_bytes / (1024 * 1024)
+
+print(f"Uso de memoria al inicio: {get_memory_usage_mb():.2f} MB")
+
+# Variables globales
 df = None
 interpreter = None
-combined_embeddings = None
 id_to_name = None
 name_to_id = None
 prod_weights = None
 main_weights = None
 sub_weights = None
 num_products = None
+product_meta = None
+
+# Definir el directorio de trabajo en DigitalOcean
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global df, interpreter, combined_embeddings, id_to_name, name_to_id
-    global prod_weights, main_weights, sub_weights, num_products
+    global df, interpreter, id_to_name, name_to_id
+    global prod_weights, main_weights, sub_weights, num_products, product_meta
 
     print("Iniciando startup...")
     try:
-        # 1. Cargar CSV y preprocesar datos
-        # Especificar columnas y tipos para optimizar memoria
-        usecols = ["name", "discount_price", "actual_price", "main_category", "sub_category"]
-        df = pd.read_csv(
-            "productos.csv", 
-            usecols=usecols, 
-            dtype={
-                "name": "string", 
-                "discount_price": "string", 
-                "actual_price": "string", 
-                "main_category": "string", 
-                "sub_category": "string"
-            }
-        )
-        
-        # Convertir precios a float32 y eliminar caracteres innecesarios
-        df['discount_price'] = (
-            df['discount_price']
-            .replace({'₹': '', ',': ''}, regex=True)
-            .astype(np.float32)
-        )
-        df['actual_price'] = (
-            df['actual_price']
-            .replace({'₹': '', ',': ''}, regex=True)
-            .astype(np.float32)
-        )
+        # Ruta correcta de los archivos en DigitalOcean
+        csv_path = os.path.join(BASE_DIR, "productos.csv")
+        model_path = os.path.join(BASE_DIR, "recomendacion.tflite")
 
-        # Normalización de precios con float32
-        max_discount = df['discount_price'].max()
-        max_actual = df['actual_price'].max()
-        if max_discount > 0:
-            df['discount_price'] = df['discount_price'] / max_discount
-        if max_actual > 0:
-            df['actual_price'] = df['actual_price'] / max_actual
+        # 1. Cargar CSV
+        usecols = ["name", "discount_price", "actual_price", "main_category", "sub_category"]
+        df = pd.read_csv(csv_path, usecols=usecols, dtype=str)
+        print(f"Uso de memoria después de cargar CSV: {get_memory_usage_mb():.2f} MB")
+
+        # Convertir precios
+        df['discount_price'] = df['discount_price'].str.replace('₹', '').str.replace(',', '').astype(np.float32)
+        df['actual_price'] = df['actual_price'].str.replace('₹', '').str.replace(',', '').astype(np.float32)
+
+        # Normalizar precios
+        df['discount_price'] /= df['discount_price'].max()
+        df['actual_price'] /= df['actual_price'].max()
+
+        print("Preprocesamiento de precios completado.")
 
         # Codificar variables
         name_enc = LabelEncoder()
@@ -68,108 +65,112 @@ async def lifespan(app: FastAPI):
         df['main_category_encoded'] = main_cat_enc.fit_transform(df['main_category'])
         sub_cat_enc = LabelEncoder()
         df['sub_category_encoded'] = sub_cat_enc.fit_transform(df['sub_category'])
+
         print("Variables codificadas.")
 
-        # Crear mapeos para convertir entre nombre e ID
-        temp_id_to_name = df[['name_encoded', 'name']].drop_duplicates().set_index('name_encoded')['name'].to_dict()
-        id_to_name = {int(k): v for k, v in temp_id_to_name.items()}
-        name_to_id = {v: int(k) for k, v in id_to_name.items()}
+        # Mapeos de nombres e IDs
+        id_to_name = dict(zip(df['name_encoded'], df['name']))
+        name_to_id = {v: k for k, v in id_to_name.items()}
+
         print("Mapeos creados.")
-        print("Preprocesamiento completado.")
 
-        # 2. Cargar el modelo TFLite (se recomienda usar un modelo cuantizado)
-        interpreter = tf.lite.Interpreter(model_path="recomendacion.tflite")
+        # Crear matriz de categorías de productos
+        num_products = df['name_encoded'].max() + 1
+        product_meta = np.zeros((num_products, 2), dtype=np.int32)
+        for _, row in df.iterrows():
+            pid = row['name_encoded']
+            product_meta[pid, 0] = row['main_category_encoded']
+            product_meta[pid, 1] = row['sub_category_encoded']
+
+        # 2. Cargar modelo TFLite
+        interpreter = tf.lite.Interpreter(model_path=model_path)
         interpreter.allocate_tensors()
-        print("Modelo TFLite cargado y tensores asignados.")
+        print("Modelo TFLite cargado.")
 
-        # Función para extraer los pesos del embedding
+        # Función para extraer pesos de embeddings
         def get_embedding_weights(layer_name):
-            candidates = []
             for tensor_detail in interpreter.get_tensor_details():
-                if layer_name in tensor_detail["name"] and "strided_slice" not in tensor_detail["name"]:
+                if layer_name in tensor_detail["name"]:
                     tensor = interpreter.get_tensor(tensor_detail["index"])
-                    if len(tensor.shape) >= 2:
-                        candidates.append((tensor_detail, tensor))
-            if not candidates:
-                raise ValueError(f"No se encontró tensor adecuado para la capa '{layer_name}'")
-            selected_detail, selected_tensor = candidates[0]
-            print(f"Tensor para '{layer_name}' seleccionado: {selected_detail['name']} con shape {selected_tensor.shape}")
-            return selected_tensor.astype(np.float32)  # Asegurarse de usar float32
+                    return tensor.astype(np.float32)
+            raise ValueError(f"No se encontró tensor para {layer_name}")
 
-        # 3. Extraer pesos de los embeddings
+        # Extraer embeddings
         prod_weights = get_embedding_weights("product_embedding")
         main_weights = get_embedding_weights("main_cat_embedding")
         sub_weights = get_embedding_weights("sub_cat_embedding")
-        num_products = prod_weights.shape[0]
+
         print("Pesos de embeddings extraídos.")
 
-        # 4. Calcular los vectores combinados para cada producto
-        def get_vector_combinado(product_id: int):
-            row = df[df['name_encoded'] == product_id].iloc[0]
-            main_cat = int(row['main_category_encoded'])
-            sub_cat = int(row['sub_category_encoded'])
-            vec_prod = prod_weights[product_id]
-            vec_main = main_weights[main_cat]
-            vec_sub = sub_weights[sub_cat]
-            return np.concatenate([vec_prod, vec_main, vec_sub]).astype(np.float32)
-        
-        combined_embeddings = np.array(
-            [get_vector_combinado(pid) for pid in range(num_products)], 
-            dtype=np.float32
-        )
-        print("Vectores combinados calculados.")
-
-        # Liberar el DataFrame ya que no se usará más
-        del df
+        # Liberar memoria
+        del interpreter
+        interpreter = None
         gc.collect()
+
+        print("Startup completado. La API está lista.")
 
     except Exception as e:
         print("Error en startup:", e)
         raise e
 
-    print("Startup completado. La API ya está lista.")
     yield
-    print("Shutdown de la API.")
+    print("Apagando API...")
 
-# Definir la aplicación FastAPI usando el lifespan event handler
+# Crear la aplicación FastAPI
 app = FastAPI(lifespan=lifespan, title="API de Recomendaciones de Productos")
 
-# Agregar middleware de CORS para permitir solicitudes de cualquier origen
-origins = ["*"]
+# Middleware CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# **Health Check para DigitalOcean**
+@app.get("/")
+def health_check():
+    return {"status": "ok"}
+
+# Funciones para embeddings
+def get_combined_embedding(product_id: int):
+    main_cat = product_meta[product_id, 0]
+    sub_cat = product_meta[product_id, 1]
+    vec_prod = prod_weights[product_id]
+    vec_main = main_weights[main_cat]
+    vec_sub = sub_weights[sub_cat]
+    return np.concatenate([vec_prod, vec_main, vec_sub]).astype(np.float32)
+
+def get_all_combined_embeddings():
+    return np.concatenate([
+        prod_weights,
+        main_weights[product_meta[:, 0]],
+        sub_weights[product_meta[:, 1]]
+    ], axis=1).astype(np.float32)
+
 def recomendar_productos_combinados(product_id: int, top_n: int = 5):
-    """
-    Recomienda productos basados en la similitud del vector combinado.
-    """
     if product_id < 0 or product_id >= num_products:
         return []
-    query_vec = combined_embeddings[product_id].reshape(1, -1)
+    query_vec = get_combined_embedding(product_id).reshape(1, -1)
+    combined_embeddings = get_all_combined_embeddings()
     similitudes = cosine_similarity(query_vec, combined_embeddings)[0]
     indices_similares = np.argsort(-similitudes)
-    # Excluir el propio producto
     indices_similares = [i for i in indices_similares if i != product_id]
-    return [int(x) for x in indices_similares[:top_n]]
+    return indices_similares[:top_n]
 
+# **Endpoint de Recomendaciones**
 @app.get("/recomendaciones")
 def get_recomendaciones(product_name: str, top_n: int = 5):
-    """
-    Endpoint que, dado el nombre de un producto, devuelve recomendaciones.
-    Ejemplo:
-      GET /recomendaciones?product_name=Camisa%20Roja&top_n=5
-    """
     if product_name not in name_to_id:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
     product_id = name_to_id[product_name]
     recomendados_ids = recomendar_productos_combinados(product_id, top_n)
-    recomendaciones = [
-        {"id": int(pid), "name": id_to_name.get(int(pid), f"ID {pid}")}
-        for pid in recomendados_ids
-    ]
+    recomendaciones = [{"id": pid, "name": id_to_name.get(pid, f"ID {pid}")} for pid in recomendados_ids]
     return {"producto": product_name, "recomendaciones": recomendaciones}
+
+# **Ejecutar Uvicorn**
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=port)
